@@ -1,0 +1,33 @@
+?start: query
+
+query : create_clause
+      | match_clause
+      | delete_clause
+      | set_clause
+
+create_clause : "CREATE" node_pattern ("," node_pattern)*
+match_clause  : "MATCH"  node_pattern ("," node_pattern)*  ("WHERE" condition)?  "RETURN" return_item ("," return_item)*
+delete_clause : "MATCH"  node_pattern ("WHERE" condition)?  "DELETE" identifier
+set_clause    : "MATCH"  node_pattern ("WHERE" condition)?  "SET" set_item ("," set_item)*
+
+node_pattern : "(" identifier ":" label (props)? ")"
+condition   : or_expr
+or_expr     : and_expr ("OR" and_expr)*
+and_expr    : not_expr ("AND" not_expr)*
+not_expr    : "NOT" not_expr | primary_condition
+primary_condition : identifier "." prop_name "=" literal
+return_item  : identifier
+set_item     : identifier "." prop_name "=" literal
+
+identifier : CNAME
+label      : CNAME
+prop_name  : CNAME
+props      : "{" prop_pair ("," prop_pair)* "}"
+prop_pair  : CNAME ":" literal
+literal    : STRING | NUMBER
+
+%import common.CNAME
+%import common.ESCAPED_STRING -> STRING
+%import common.NUMBER
+%import common.WS
+%ignore WS

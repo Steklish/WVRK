@@ -87,93 +87,99 @@ class Exec(Transformer):
         # просто отдаём дерево дальше
         return Tree('condition', children)
 
-    def primary_condition(self, children):
-        # всегда плоский кортеж
-        ident, prop, val = children
-        return ('=', str(ident), str(prop), _unwrap(val))
-    
     def _flatten_expr(self, expr):
-        """Tree → плоский кортеж ('=', 'n', 'name', 'Bob1') или ('AND', left, right)."""
-        # 1. один ребёнок – углубляемся
-        if isinstance(expr, Tree) and len(expr.children) == 1:
-            return self._flatten_expr(expr.children[0])
-
-        # 2. два ребёнка – «плющ» + рекурсия
+        """Tree → плоский кортеж ('=', 'n', 'name', 'Bob1') | ('AND',L,R) | ('OR',L,R) ."""
+        if isinstance(expr, tuple):
+            return expr
+        if (isinstance(expr, Tree) and expr.data == 'primary_condition' and len(expr.children) == 2 and isinstance(expr.children[0], Token) and expr.children[0].type == 'NOT'):
+            sub = self._flatten_expr(expr.children[1])
+            return ('NOT', sub)
+        
+        # 1. бинарные операции: OR / AND
         if isinstance(expr, Tree) and len(expr.children) == 2:
             op = 'OR' if expr.data == 'or_expr' else 'AND'
-            left  = self._flatten_expr(expr.children[0])
+            left = self._flatten_expr(expr.children[0])
             right = self._flatten_expr(expr.children[1])
             return (op, left, right)
 
-        # 3. лист – primary_condition
-        if isinstance(expr, Tree) and expr.data == 'primary_condition':
-            ident_tok, prop_tok, val_tok = expr.children
-            return ('=', str(ident_tok), str(prop_tok), _unwrap(val_tok))
-
-        # 4. not_expr – убрать один уровень
-        if isinstance(expr, Tree) and expr.data == 'not_expr' and len(expr.children) == 1:
+        # 2. один ребёнок – спускаемся (скобки / обёртки)
+        if isinstance(expr, Tree) and len(expr.children) == 1:
             return self._flatten_expr(expr.children[0])
 
-        # 5. всё остальное – уже плоско
+        # 3. primary_condition – раскрываем вручную
+        if isinstance(expr, Tree) and expr.data == 'primary_condition':
+            # print('[CHILD]', expr.children)
+            ident_tok, prop_tok, op_tok, val_tok = expr.children
+            op_token = op_tok.children[0]  # Tree → Token
+            return (str(op_token),
+                    str(ident_tok),
+                    str(prop_tok),
+                    _unwrap(val_tok))
+
         return expr
     
     def _filter_nodes(self, expr, label, ident, pre_nodes=None):
-        # 0. рекурсивно раскрываем Tree до плоского выражения
-        # print(len(expr.children), expr.data)
-        while isinstance(expr, Tree):
-            if expr.data == 'condition' and len(expr.children) == 1:
-                expr = expr.children[0]
-            elif expr.data == 'condition' and len(expr.children) == 3:
-                op_tok, left_tree, right_tree = expr.children
-                expr = (str(op_tok), left_tree, right_tree)
-            elif expr.data == 'primary_condition':
-                ident_tok, prop_tok, val_tok = expr.children
-                expr = ('=', str(ident_tok), str(prop_tok), _unwrap(val_tok))
-            else:
-                expr = expr.children[0] if expr.children else expr
-        # print(expr)
-        # 1. (=, ident, prop, val)
-        if expr[0] == '=':
-            _, e_ident, prop, val = expr
+        import operator
+        op_map = {'=': operator.eq, '!=': operator.ne,
+                '>': operator.gt, '>=': operator.ge,
+                '<': operator.lt, '<=': operator.le}
+        
+        # print("[DEBUG]", expr)
+        # 1. primary_condition
+        if expr[0] in op_map:
+            op_str, e_ident, prop, val = expr
             if e_ident != ident:
                 return pre_nodes if pre_nodes is not None else []
-            if pre_nodes is None:
+
+            op_func = op_map[op_str]
+            if pre_nodes is None and op_str == "=":
                 ids = self.graph.index.lookup(label, prop, str(val))
-                # print(ids)
                 return [self.graph.get_node(i) for i in ids if self.graph.get_node(i)]
-            else:
-                result = [n for n in pre_nodes if prop in n.props and n.props[prop] == val]
-                return result
+
+            if pre_nodes is None:
+                cur = self.graph.db.execute("SELECT id FROM nodes WHERE json_extract(labels,'$[0]')=?", (label,))
+                pre_nodes = [self.graph.get_node(r[0]) for r in cur if self.graph.get_node(r[0])]
+
+            result = []
+            for n in pre_nodes:
+                if prop in n.props:
+                    try:
+                        node_val = float(n.props[prop])
+                        comp_val = float(val)
+                    except (ValueError, TypeError):
+                        node_val = str(n.props[prop])
+                        comp_val = str(val)
+                    if op_func(node_val, comp_val):
+                        result.append(n)
+            return result
 
         # 2. AND
         if expr[0] == 'AND':
             left, right = expr[1], expr[2]
             interim = self._filter_nodes(left, label, ident, pre_nodes)
-            result  = self._filter_nodes(right, label, ident, interim)
-            return result
+            return self._filter_nodes(right, label, ident, interim)
 
         # 3. OR
         if expr[0] == 'OR':
             left, right = expr[1], expr[2]
-            left_ids  = [n.id for n in self._filter_nodes(left, label, ident, pre_nodes)]
-            right_ids = [n.id for n in self._filter_nodes(right, label, ident, pre_nodes)]
-            merged_ids = set(left_ids) | set(right_ids)
-            # возвращаем Node-ы по id
-            return [n for n in self.graph.db.execute(
-                "SELECT id, labels, props FROM nodes WHERE id IN ({})".format(','.join('?'*len(merged_ids))),
-                list(merged_ids))
-            ] if merged_ids else []
-        
-        
+            left_ids  = {n.id for n in self._filter_nodes(left, label, ident, pre_nodes)}
+            right_ids = {n.id for n in self._filter_nodes(right, label, ident, pre_nodes)}
+            merged = left_ids | right_ids
+            if not merged:
+                return []
+            cur = self.graph.db.execute(
+                f"SELECT id, labels, props FROM nodes WHERE id IN ({','.join('?'*len(merged))})",
+                list(merged))
+            return [Node(id=r[0], labels=json.loads(r[1]), props=json.loads(r[2])) for r in cur]
         # 4. NOT
         if expr[0] == 'NOT':
             sub = expr[1]
             if pre_nodes is None:
                 cur = self.graph.db.execute("SELECT id FROM nodes WHERE json_extract(labels,'$[0]')=?", (label,))
-                pre_nodes = [self.graph.get_node(row[0]) for row in cur]
-                pre_nodes = [n for n in pre_nodes if n is not None]
-            forbidden = set(self._filter_nodes(sub, label, ident, pre_nodes))
-            return [n for n in pre_nodes if n not in forbidden]
+                pre_nodes = [self.graph.get_node(r[0]) for r in cur if self.graph.get_node(r[0])]
+            forbidden_ids = {n.id for n in self._filter_nodes(sub, label, ident, pre_nodes)}
+            return [n for n in pre_nodes if n.id not in forbidden_ids]
+        return []
         
     def match_clause(self, args):
         node_spec, *rest = args

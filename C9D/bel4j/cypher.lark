@@ -13,18 +13,30 @@ set_clause    : "MATCH"  node_pattern ("WHERE" condition)?  "SET" set_item ("," 
 node_pattern : "(" identifier ":" label (props)? ")"
 condition   : or_expr
 or_expr     : and_expr ("OR" and_expr)*
-and_expr    : not_expr ("AND" not_expr)*
-not_expr    : "NOT" not_expr | primary_condition
-primary_condition : identifier "." prop_name "=" literal
+and_expr    : primary_condition ("AND" primary_condition)*
+
+primary_condition : NOT primary_condition | identifier "." prop_name op literal | "(" condition ")"  
+
+op : EQUAL | GT | GE | LT | LE | NE
+
 return_item  : identifier
 set_item     : identifier "." prop_name "=" literal
 
+NOT : "NOT"
 identifier : CNAME
 label      : CNAME
 prop_name  : CNAME
 props      : "{" prop_pair ("," prop_pair)* "}"
 prop_pair  : CNAME ":" literal
 literal    : STRING | NUMBER
+
+# ---------- операторы сравнения ----------
+EQUAL : "="
+GT    : ">"
+GE    : ">="
+LT    : "<"
+LE    : "<="
+NE    : "!="
 
 %import common.CNAME
 %import common.ESCAPED_STRING -> STRING

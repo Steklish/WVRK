@@ -45,8 +45,8 @@ class Graph:
                 end_id TEXT NOT NULL,
                 type TEXT NOT NULL,
                 props TEXT NOT NULL,
-                FOREIGN KEY(start_id) REFERENCES nodes(id),
-                FOREIGN KEY(end_id) REFERENCES nodes(id))
+                FOREIGN KEY(start_id) REFERENCES nodes(id) ON DELETE CASCADE,
+                FOREIGN KEY(end_id) REFERENCES nodes(id) ON DELETE CASCADE)
         """)
         self.db.execute("""
             CREATE TABLE IF NOT EXISTS idx(
@@ -54,9 +54,14 @@ class Graph:
                 prop_key TEXT,
                 prop_val TEXT,
                 node_id TEXT,
-                FOREIGN KEY(node_id) REFERENCES nodes(id))
+                FOREIGN KEY(node_id) REFERENCES nodes(id) ON DELETE CASCADE)
         """)
+        
+        # Дополнительные индексы для производительности
+        self.db.execute("CREATE INDEX IF NOT EXISTS idx_label ON idx(label)")
+        self.db.execute("CREATE INDEX IF NOT EXISTS idx_key_val ON idx(prop_key, prop_val)")
         self.db.execute("PRAGMA foreign_keys = ON")
+
     # ---------- nodes ----------
     def create_node(self, labels: Set[str], props: Dict[str, Any]) -> Node:
         nid = str(uuid.uuid4())
@@ -69,11 +74,13 @@ class Graph:
         row = self.db.execute("SELECT labels,props FROM nodes WHERE id=?", (nid,)).fetchone()
         if row:
             return Node(nid, set(json.loads(row[0])), json.loads(row[1]))
+        return None
 
     def delete_node(self, nid: str):
+        """Удаление с правильным порядком: сначала индекс, потом связи, потом узел"""
+        self.index.drop_node(nid)
         self.db.execute("DELETE FROM rels WHERE start_id=? OR end_id=?", (nid, nid))
         self.db.execute("DELETE FROM nodes WHERE id=?", (nid,))
-        self.index.drop_node(nid)
 
     def update_node(self, nid: str, new_props: Dict[str, Any]):
         node = self.get_node(nid)
@@ -90,7 +97,29 @@ class Graph:
                        (rid, start, end, rel_type, json.dumps(props)))
         return Relationship(rid, start, end, rel_type, props)
 
-    # ---------- utils ----------
+    def delete_rel(self, rid: str):
+        self.db.execute("DELETE FROM rels WHERE id=?", (rid,))
+
+    def get_rels(self, node_id: str, direction: str = 'both', rel_type: Optional[str] = None) -> List[Relationship]:
+        """Получение связей узла"""
+        if direction == 'out':
+            sql = "SELECT * FROM rels WHERE start_id=?"
+            params = (node_id,)
+        elif direction == 'in':
+            sql = "SELECT * FROM rels WHERE end_id=?"
+            params = (node_id,)
+        else:
+            sql = "SELECT * FROM rels WHERE start_id=? OR end_id=?"
+            params = (node_id, node_id)
+        
+        if rel_type:
+            sql += " AND type=?"
+            params += (rel_type,)
+        
+        cur = self.db.execute(sql, params)
+        return [Relationship(r[0], r[1], r[2], r[3], json.loads(r[4])) for r in cur]
+
+    # ---------- transactions ----------
     def begin(self):
         self.db.execute("BEGIN")
 
@@ -102,13 +131,12 @@ class Graph:
 
     # ---------- index ----------
     def _update_index(self, nid: str, label: str, new_props: dict[str, Any]):
-        """Обновляет idx после изменения свойств узла."""
-        # удаляем старые записи для этого узла и этих ключей
+        """Обновляет idx после изменения свойств узла"""
+        # Удаляем старые записи для этого узла и этих ключей
         for k in new_props:
-            self.db.execute(
-                "DELETE FROM idx WHERE node_id=? AND prop_key=?", (nid, k))
+            self.db.execute("DELETE FROM idx WHERE node_id=? AND prop_key=?", (nid, k))
             v = new_props[k]
-            if v is not None:          # добавляем только если значение не None
+            if v is not None:
                 self.db.execute(
                     "INSERT INTO idx(label,prop_key,prop_val,node_id) VALUES(?,?,?,?)",
                     (label, k, str(v), nid))

@@ -207,9 +207,35 @@ class Exec(Transformer):
         for n in nodes:
             returned.append({ident_list[0]: n})
         return returned
-    
-    def delete_clause(self, _):
-        return []
+        
+    def delete_clause(self, args):
+        # args: [node_spec, where_condition?]
+        node_spec = args[0]
+        ident_list, label_list, _ = node_spec
+        label = label_list[0]
+        ident = ident_list[0]
+        
+        where = None
+        for r in args[1:]:
+            if isinstance(r, Tree) and r.data == 'condition':
+                where = r
+                break
+        
+        # Находим узлы для удаления
+        if where:
+            flat_expr = self._flatten_expr(where)
+            nodes = self._filter_nodes(flat_expr, label, ident, None)
+        else:
+            # Если нет WHERE — удаляем ВСЕ узлы с таким label (опасно!)
+            cur = self.graph.db.execute("SELECT id FROM nodes WHERE json_extract(labels,'$[0]')=?", (label,))
+            nodes = [self.graph.get_node(row[0]) for row in cur]
+        
+        deleted_count = 0
+        for node in nodes:
+            self.graph.delete_node(node.id)  # Каскадное удаление связей уже есть в core.py
+            deleted_count += 1
+        
+        return [{"deleted": deleted_count, "nodes": [n.id for n in nodes]}]
     
     def set_clause(self, args):
         # разбор уже есть, получаем node_id, new_props, label

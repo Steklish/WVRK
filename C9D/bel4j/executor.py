@@ -32,21 +32,20 @@ class Exec(Transformer):
 
     # ========== единый обработчик CREATE ==========
     def create_clause(self, children):
-        # children — список кортежей (ident_list, label_list, props_dict)
-        result = []
-        for ident_list, label_list, props_dict in children:
-            label = label_list[0]
-            node = self.graph.create_node({label}, props_dict or {})
-            result.append(node)
-        return result
+        """CREATE (a)-[:R]->(b) -- children содержит path_pattern'ы"""
+        results = []
+        for path in children:
+            created = self._create_path(path)
+            results.extend(created)
+        return results
     
     # ========== обработка шаблонов узлов ==========
     def node_pattern(self, children):
-        # children = [identifier, label, props(optional)]
-        identifier = str(children[0])  # identifier
-        label = str(children[1])       # label
-        props = children[2] if len(children) > 2 else {}  # props or empty dict
-        return [identifier], [label], props
+        var = str(children[0])
+        label = str(children[1]) if len(children) > 1 else 'Node'
+        props = children[2] if len(children) > 2 and isinstance(children[2], dict) else {}
+        
+        return {'type': 'node', 'var': var, 'label': label, 'props': props}
 
     def props(self, children):
         # Children are prop_pairs
@@ -182,38 +181,48 @@ class Exec(Transformer):
         return []
         
     def match_clause(self, args):
-        node_spec, *rest = args
-        ident_list, label_list, _props = node_spec
-        label = label_list[0]
+        path = args[0]
         where = None
-        ret_ids = []
-        for r in rest:
+        ret_items = []  # теперь это список строк!
+        
+        for r in args[1:]:
             if isinstance(r, Tree) and r.data == 'condition':
                 where = r
-            elif isinstance(r, list):
-                ret_ids = r
-        nodes: list[Node] = []
-        if where:
-            # print("where --> ", where)
-            flat_expr = self._flatten_expr(where)
-            # print("flat_expr --> ", flat_expr)
-            nodes = self._filter_nodes(flat_expr, label, ident_list[0], None)
-        else:
-            cur = self.graph.db.execute("SELECT id FROM nodes WHERE json_extract(labels,'$[0]')=?", (label,))
-            nodes = [self.graph.get_node(row[0]) for row in cur]
-            nodes = [n for n in nodes if n is not None]
-
-        returned = []
-        for n in nodes:
-            returned.append({ident_list[0]: n})
-        return returned
+            elif isinstance(r, str):  # return_item теперь возвращает строку
+                ret_items.append(r)
+            elif isinstance(r, list):  # на случай если несколько return_item
+                ret_items.extend([x for x in r if isinstance(x, str)])
+        
+        # Если нет return_items, возвращаем все переменные из пути
+        if not ret_items and path:
+            ret_items = [elem.get('var') for elem in path if elem.get('var')]
+        
+        # Ищем пути
+        matches = self._match_path(path, where)
+        
+        # Формируем результат
+        results = []
+        for match in matches:
+            row = {}
+            for item in ret_items:
+                if '.' in item:
+                    var, prop = item.split('.')
+                    obj = match.get(var)
+                    if isinstance(obj, (Node, Relationship)):
+                        row[item] = obj.props.get(prop)
+                    else:
+                        row[item] = None
+                else:
+                    obj = match.get(item)
+                    row[item] = obj
+            results.append(row)
+        return results
         
     def delete_clause(self, args):
         # args: [node_spec, where_condition?]
-        node_spec = args[0]
-        ident_list, label_list, _ = node_spec
-        label = label_list[0]
-        ident = ident_list[0]
+        node_spec = args[0]  # dict: {'type': 'node', 'var': 'p', 'label': 'Person', ...}
+        label = node_spec['label']
+        ident = node_spec['var']
         
         where = None
         for r in args[1:]:
@@ -238,46 +247,317 @@ class Exec(Transformer):
         return [{"deleted": deleted_count, "nodes": [n.id for n in nodes]}]
     
     def set_clause(self, args):
-        # разбор уже есть, получаем node_id, new_props, label
-        node_spec, *rest = args
-        ident_list, label_list, _props = node_spec
-        label = label_list[0]
+        """MATCH ... SET ... - работает с новым форматом dict"""
+        node_spec = args[0]  # dict: {'type': 'node', 'var': 'n', 'label': 'Person', ...}
+        label = node_spec['label']
+        ident = node_spec['var']
+        
         where = None
         set_items = []
-        for r in rest:
+        for r in args[1:]:
             if isinstance(r, Tree) and r.data == 'condition':
                 where = r
-            elif isinstance(r, list):
+            elif isinstance(r, list):  # set_items приходят списком
                 set_items = r
 
-        # находим узел
+        # Находим узлы
         flat_where = self._flatten_expr(where) if where else None
-        nodes = self._filter_nodes(flat_where, label, ident_list[0], None) if where else []
+        nodes = self._filter_nodes(flat_where, label, ident, None) if where else []
+        
+        if not nodes:
+            # Если нет WHERE, берем все узлы с этим label
+            cur = self.graph.db.execute("SELECT id FROM nodes WHERE json_extract(labels,'$[0]')=?", (label,))
+            nodes = [self.graph.get_node(row[0]) for row in cur if self.graph.get_node(row[0])]
+
         if not nodes:
             return []
 
-        # применяем SET к первому найденному (упрощённо)
-        node = nodes[0]
-        new_props = {}
-        for item in set_items:          # item = ('=', 'n', 'age', 30)
-            _, e_ident, prop, val = item
-            if e_ident == ident_list[0]:
-                new_props[prop] = val
-
-        # обновляем SQLite
-        self.graph.db.execute("UPDATE nodes SET props=? WHERE id=?",
-                            (json.dumps({**node.props, **new_props}), node.id))
-        # обновляем индекс
-        self.graph._update_index(node.id, label, new_props)
-        # обновляем объект в памяти
-        node.props.update(new_props)
-        return [node]
+        # Применяем SET к найденным узлам
+        updated = []
+        for node in nodes:
+            new_props = {}
+            for item in set_items:  # item = ('=', 'n', 'age', 30)
+                _, e_ident, prop, val = item
+                if e_ident == ident:
+                    new_props[prop] = val
+            
+            if new_props:
+                # Обновляем SQLite
+                merged_props = {**node.props, **new_props}
+                self.graph.db.execute("UPDATE nodes SET props=? WHERE id=?",
+                                    (json.dumps(merged_props), node.id))
+                # Обновляем индекс
+                self.graph._update_index(node.id, label, new_props)
+                # Обновляем объект в памяти
+                node.props.update(new_props)
+                updated.append(node)
+        
+        return updated
+    
     def return_item(self, children):
-        return children[0] if children else None
+        """Возвращает строку 'n' или 'n.name'"""
+        if len(children) == 1:
+            return str(children[0])
+        elif len(children) == 2:
+            return f"{children[0]}.{children[1]}"  # n.name
+        return str(children[0])
+
     def set_item(self, children):
         return children
     
+    def path_pattern(self, children):
+        """Всегда возвращает список элементов пути"""   
+        if not isinstance(children, list):
+            children = [children]
+        return children
 
+    def rel_pattern(self, children):
+        result = {'type': 'rel', 'direction': 'out'}
+        for child in children:
+            if isinstance(child, Token):
+                if child.value == '<-': result['direction'] = 'in'
+                elif child.value == '->': result['direction'] = 'out'
+            elif isinstance(child, dict):
+                result.update(child)
+        return result
+    
+    def rel_info(self, children):
+        """Парсит [r:TYPE {props}] - исправлено для различения var и type"""
+        result = {}
+        for child in children:
+            if isinstance(child, str):  # <-- ИЗМЕНЕНИЕ: проверяем str первым!
+                # Это уже строка (от processed Token)
+                val = child
+                if val[0].islower() if val else False:  # переменные обычно с маленькой
+                    result['var'] = val
+                else:
+                    result['rel_type'] = val
+            elif isinstance(child, Token):
+                val = str(child)
+                if val[0].islower() if val else False:
+                    result['var'] = val
+                else:
+                    result['rel_type'] = val
+            elif isinstance(child, Tree):
+                if child.data == 'rel_type' and child.children:
+                    result['rel_type'] = str(child.children[0])
+            elif isinstance(child, dict):
+                result['props'] = child
+        return result
+
+    def _create_path(self, path_elements):
+        """Создает цепочку: узел-связь-узел с учетом направления (->, <-, --)"""
+        created = []
+        nodes = []  # [(var_name, node_obj), ...]
+        pending_rel = None  # Отложенная связь с направлением
+        
+        i = 0
+        while i < len(path_elements):
+            elem = path_elements[i]
+            
+            if elem['type'] == 'node':
+                # Создаем узел
+                node = self.graph.create_node(
+                    {elem['label']}, 
+                    elem.get('props', {})
+                )
+                nodes.append((elem.get('var'), node))
+                created.append(node)
+                
+                # Если есть отложенная связь и теперь узлов достаточно - создаем её
+                if pending_rel and len(nodes) >= 2:
+                    prev_node = nodes[-2][1]  # предыдущий узел (a)
+                    curr_node = nodes[-1][1]  # текущий узел (b)
+                    
+                    # Определяем направление связи
+                    direction = pending_rel.get('direction', 'out')
+                    
+                    if direction == 'in':
+                        # Входящая связь: (a)<-[:TYPE]-(b) означает b->a
+                        # start = b (текущий), end = a (предыдущий)
+                        start_id = curr_node.id
+                        end_id = prev_node.id
+                    else:
+                        # Исходящая или ненаправленная: (a)-[:TYPE]->(b)
+                        # start = a (предыдущий), end = b (текущий)
+                        start_id = prev_node.id
+                        end_id = curr_node.id
+                    
+                    rel = self.graph.create_rel(
+                        start_id,
+                        end_id,
+                        pending_rel.get('rel_type', 'RELATED'),
+                        pending_rel.get('props', {})
+                    )
+                    created.append(rel)
+                    pending_rel = None  # Сбрасываем отложенную связь
+                    
+            elif elem['type'] == 'rel':
+                # Откладываем связь до создания следующего узла
+                pending_rel = elem
+                    
+            i += 1
+        
+        return created
+
+    def _match_path(self, path_elements, where):
+        """Ищет все пути, соответствующие паттерну (a)-[r]->(b)"""
+        if not path_elements:
+            return []
+        
+        # Начинаем с первого узла
+        first_elem = path_elements[0]
+        start_nodes = self._find_start_nodes(first_elem)
+        
+        matches = []
+        for node in start_nodes:
+            initial_match = {first_elem.get('var', 'n'): node}
+            self._traverse_path(0, path_elements, initial_match, where, matches)
+        return matches
+    
+    def _traverse_path(self, pos, path, current_match, where, results):
+        """Рекурсивный обход - исправлены границы-check"""
+        if pos >= len(path):
+            if self._check_where_for_match(current_match, where):
+                results.append(current_match.copy())
+            return
+        
+        current_elem = path[pos]
+        
+        # Если это последний элемент (узел) и мы дошли до конца
+        if pos == len(path) - 1 and current_elem.get('type') == 'node':
+            if self._check_where_for_match(current_match, where):
+                results.append(current_match.copy())
+            return
+        
+        if pos + 1 >= len(path):
+            return
+        
+        next_elem = path[pos + 1]
+        
+        if current_elem.get('type') == 'node' and next_elem.get('type') == 'rel':
+            node_var = current_elem.get('var')
+            if node_var not in current_match:
+                return
+                
+            current_node = current_match[node_var]
+            
+            direction = next_elem.get('direction', 'out')
+            rel_type = next_elem.get('rel_type')
+            try:
+                rels = self.graph.get_rels(current_node.id, direction, rel_type)
+            except Exception as e:
+                print(f"[DEBUG] ERROR: {e}")
+                return
+
+            for rel in rels:
+                # Определяем соседний узел
+                neighbor_id = None
+                if direction == 'out':
+                    neighbor_id = rel.end
+                elif direction == 'in':
+                    neighbor_id = rel.start
+                else:  # both
+                    neighbor_id = rel.end if rel.start == current_node.id else rel.start
+                
+                neighbor = self.graph.get_node(neighbor_id)
+                if not neighbor:
+                    continue
+                
+                # Проверяем следующий узел в паттерне (если есть)
+                next_node_var = None
+                if pos + 2 < len(path):
+                    next_node_spec = path[pos + 2]
+                    if next_node_spec.get('type') == 'node':
+                        if next_node_spec.get('label') and next_node_spec['label'] not in neighbor.labels:
+                            continue
+                        next_node_var = next_node_spec.get('var')
+                
+                # Добавляем в матч
+                rel_var = next_elem.get('var')
+                if rel_var:
+                    current_match[rel_var] = rel
+                
+                if next_node_var:
+                    current_match[next_node_var] = neighbor
+                
+                # Рекурсия
+                self._traverse_path(pos + 2, path, current_match, where, results)
+                
+                # Бэктрекинг
+                if rel_var and rel_var in current_match:
+                    del current_match[rel_var]
+                if next_node_var and next_node_var in current_match:
+                    del current_match[next_node_var]
+                    
+    def _find_start_nodes(self, node_spec):
+        """Находит стартовые узлы по label/props"""
+        label = node_spec.get('label')
+        props = node_spec.get('props', {})
+        
+        # Используем индекс если есть конкретное свойство
+        if label and props:
+            for k, v in props.items():
+                ids = self.graph.index.lookup(label, k, str(v))
+                if ids:
+                    return [self.graph.get_node(i) for i in ids if self.graph.get_node(i)]
+        
+        # Иначе сканируем по label
+        if label:
+            cur = self.graph.db.execute("SELECT id FROM nodes WHERE json_extract(labels,'$[0]')=?", (label,))
+        else:
+            cur = self.graph.db.execute("SELECT id FROM nodes")
+        
+        return [self.graph.get_node(row[0]) for row in cur if self.graph.get_node(row[0])]
+    def _check_where_for_match(self, match, where):
+        """Проверяет WHERE для найденного пути"""
+        if not where:
+            return True
+        flat = self._flatten_expr(where)
+        return self._eval_condition(flat, match)  # Нужно создать _eval_condition
+    
+    def _eval_condition(self, expr, match):
+        """Вычисляет условие WHERE для найденного пути"""
+        if not isinstance(expr, tuple):
+            return False
+            
+        # Логические операторы
+        if expr[0] == 'AND':
+            return self._eval_condition(expr[1], match) and self._eval_condition(expr[2], match)
+        if expr[0] == 'OR':
+            return self._eval_condition(expr[1], match) or self._eval_condition(expr[2], match)
+        if expr[0] == 'NOT':
+            return not self._eval_condition(expr[1], match)
+        
+        # Операторы сравнения
+        op_map = {
+            '=': lambda a, b: a == b,
+            '!=': lambda a, b: a != b,
+            '>': lambda a, b: float(a) > float(b) if isinstance(a, (int, float)) and isinstance(b, (int, float)) else False,
+            '>=': lambda a, b: float(a) >= float(b) if isinstance(a, (int, float)) and isinstance(b, (int, float)) else False,
+            '<': lambda a, b: float(a) < float(b) if isinstance(a, (int, float)) and isinstance(b, (int, float)) else False,
+            '<=': lambda a, b: float(a) <= float(b) if isinstance(a, (int, float)) and isinstance(b, (int, float)) else False,
+        }
+        
+        if expr[0] in op_map:
+            op, var, prop, val = expr
+            if var not in match:
+                return False
+            
+            obj = match[var]
+            actual_val = None
+            if isinstance(obj, Node):
+                actual_val = obj.props.get(prop)
+            elif isinstance(obj, Relationship):
+                actual_val = obj.props.get(prop)
+            
+            try:
+                return op_map[op](actual_val, val)
+            except (ValueError, TypeError):
+                # Если не получилось сравнить как числа, сравниваем как строки
+                return str(actual_val) == str(val) if op == '=' else False
+        
+        return False
 def execute(graph: Graph, query: str):
     tree = parser.parser.parse(query)
     result = Exec(graph).transform(tree)

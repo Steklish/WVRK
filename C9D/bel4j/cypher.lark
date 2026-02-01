@@ -10,8 +10,12 @@ create_paths : path_pattern ("," path_pattern)*
 return_items : return_item ("," return_item)*
 
 create_clause : "CREATE" create_paths
-delete_clause : "DELETE" node_pattern ("WHERE" condition)?
 update_clause : "UPDATE" node_pattern ("WHERE" condition)? "SET" set_item ("," set_item)*
+
+delete_clause : "DELETE" delete_items ("WHERE" condition)?
+delete_items  : delete_item ("," delete_item)*
+delete_item   : delete_path | bare_rel | rel_both                            
+delete_path   : node_pattern rel_pattern node_pattern | node_pattern
 
 path_pattern  : node_pattern (rel_pattern node_pattern)*
 node_pattern  : "(" identifier? (":" label)? (props)? ")"
@@ -20,6 +24,7 @@ rel_pattern   : rel_out | rel_in | rel_both
 rel_out       : "-[" rel_info "]->"
 rel_in        : "<-[" rel_info "]-"
 rel_both      : "-[" rel_info "]-"
+bare_rel      : "[" rel_info "]"  
 rel_info      : identifier? (":" rel_type)? (props)?
 rel_type      : CNAME
 

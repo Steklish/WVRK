@@ -51,12 +51,14 @@ class Exec(Transformer):
     # ========== обработка шаблонов узлов ==========
     def node_pattern(self, children):
         # Обработка случая, когда identifier отсутствует
+        
         var = None
         label = None
         props = {}
         
         for child in children:
             if isinstance(child, str):
+            
                 if var is None and not child.startswith(':') and '=' not in child:
                     var = child
                 elif child != var:
@@ -74,6 +76,14 @@ class Exec(Transformer):
 
     def return_items(self, children):
         return children
+    
+    def bare_rel(self, children):
+        """Обрабатывает [:TYPE]"""
+        result = {'type': 'rel', 'direction': 'both'}
+        for child in children:
+            if isinstance(child, dict):
+                result.update(child)
+        return result
 
     def props(self, children):
         # Children are prop_pairs
@@ -292,35 +302,202 @@ class Exec(Transformer):
                         row[item] = obj
             results.append(row)
         return results
+    def delete_path(self, children):
+        """Обрабатывает delete_path: node_pattern или node_pattern rel_pattern node_pattern"""
+        elements = [c for c in children if isinstance(c, dict)]
+        
+        has_rel = any(e.get('type') == 'rel' for e in elements)
+        
+        if has_rel:
+            return {'type': 'path', 'elements': elements}
+        else:
+            # Только node_pattern
+            return elements[0] if elements else {'type': 'node', 'var': None, 'label': None, 'props': {}}
         
     def delete_clause(self, args):
-        node_spec = args[0]
-        label = node_spec['label']  
-        ident = node_spec['var']
+        """DELETE (n), ()-[]-(), [r:TYPE]"""
+        items_to_delete = args[0] if args else []
+        
+        if not isinstance(items_to_delete, list):
+            items_to_delete = [items_to_delete]
         
         where = None
-        for r in args[1:]:
-            if isinstance(r, Tree) and r.data == 'condition':
-                where = r
-                break
+        if len(args) > 1 and isinstance(args[1], Tree) and args[1].data == 'condition':
+            where = args[1]
         
-        if where:
-            flat_expr = self._flatten_expr(where)
-            nodes = self._filter_nodes(flat_expr, label, ident, None)
-        else:
-            if label is None:
-                cur = self.graph.db.execute("SELECT id FROM nodes")
-            else:
-                cur = self.graph.db.execute("SELECT id FROM nodes WHERE json_extract(labels,'$[0]')=?", (label,))
-            nodes = [self.graph.get_node(row[0]) for row in cur if self.graph.get_node(row[0])]
+        deleted_nodes = []
+        deleted_rels = []
         
-        deleted_count = 0
-        for node in nodes:
-            self.graph.delete_node(node.id)
-            deleted_count += 1
+        for item in items_to_delete:
+            if not isinstance(item, dict):
+                continue
+            
+            item_type = item.get('type')
+            
+            if item_type == 'node':
+                nodes = self._find_nodes_to_delete(item, where)
+                for node in nodes:
+                    self._delete_rels_for_node(node.id)
+                    self.graph.delete_node(node.id)
+                    deleted_nodes.append(node.id)
+                    
+            elif item_type == 'rel':
+                rels = self._find_rels_to_delete(item, where)
+                for rel in rels:
+                    self.graph.delete_rel(rel.id)
+                    deleted_rels.append(rel.id)
+                    
+            elif item_type == 'path':
+                # Путь ()-[]-() - удаляем связь между узлами
+                elements = item.get('elements', [])
+                if len(elements) >= 3:  # node - rel - node
+                    start_node = elements[0]
+                    rel = elements[1]
+                    end_node = elements[2]
+                    
+                    # Находим конкретную связь
+                    rels = self._find_rels_in_path(start_node, rel, end_node, where)
+                    for r in rels:
+                        self.graph.delete_rel(r.id)
+                        deleted_rels.append(r.id)
         
-        return [{"deleted": deleted_count, "nodes": [n.id for n in nodes]}]
+        return [{
+            "deleted_nodes": len(deleted_nodes),
+            "deleted_rels": len(deleted_rels),
+            "node_ids": deleted_nodes,
+            "rel_ids": deleted_rels
+        }]
     
+    def _find_rels_in_path(self, start_node_spec, rel_spec, end_node_spec, where=None):
+        """Находит связи между двумя узлами по спецификации"""
+        rel_type = rel_spec.get('rel_type')
+        direction = rel_spec.get('direction', 'both')
+        
+        # Находим стартовые узлы
+        start_nodes = self._find_nodes_to_delete(start_node_spec, None)
+        end_nodes = self._find_nodes_to_delete(end_node_spec, None)
+        
+        start_ids = {n.id for n in start_nodes}
+        end_ids = {n.id for n in end_nodes}
+        
+        # Ищем связи
+        sql = "SELECT id, start_id, end_id, type, props FROM rels WHERE 1=1"
+        params = []
+        
+        if rel_type:
+            sql += " AND type = ?"
+            params.append(rel_type)
+        
+        cur = self.graph.db.execute(sql, params)
+        result = []
+        
+        for row in cur:
+            rel = Relationship(row[0], row[1], row[2], row[3], json.loads(row[4]))
+            
+            # Проверяем направление
+            matches_start = rel.start in start_ids and rel.end in end_ids
+            matches_end = rel.end in start_ids and rel.start in end_ids
+            
+            if direction == 'out' and matches_start:
+                result.append(rel)
+            elif direction == 'in' and matches_end:
+                result.append(rel)
+            elif direction == 'both' and (matches_start or matches_end):
+                result.append(rel)
+        
+        return result
+    def delete_items(self, children):
+        """Обрабатывает список элементов для удаления"""
+        return children  # children уже список обработанных delete_item
+
+    def delete_item(self, children):
+        """Обрабатывает delete_item: узел, путь ()-[]-(), или просто связь [] / -[]-"""
+        elements = [c for c in children if isinstance(c, dict)]
+        
+        # Если всего один элемент и это связь - это bare_rel [:TYPE] или rel_both -[:TYPE]-
+        if len(elements) == 1 and elements[0].get('type') == 'rel':
+            return elements[0]
+        # Если несколько элементов с связью - это путь ()-[]-()
+        elif len(elements) > 1 and any(e.get('type') == 'rel' for e in elements):
+            return {'type': 'path', 'elements': elements}
+        # Если один элемент (узел)
+        elif len(elements) == 1:
+            return elements[0]
+        else:
+            return {'type': 'node', 'var': None, 'label': None, 'props': {}}
+    
+    def _find_nodes_to_delete(self, node_spec, where=None):
+        """Находит узлы для удаления"""
+        label = node_spec.get('label')
+        props = node_spec.get('props', {})
+        var = node_spec.get('var')
+        
+        # Если есть переменная в контексте
+        if var and var in self.context:
+            node = self.context[var]
+            if where and not self._check_where_for_match({var: node}, where):
+                return []
+            return [node]
+        
+        # Ищем по label/props
+        nodes = self._find_start_nodes(node_spec)
+        
+        # Применяем WHERE если есть
+        if where:
+            filtered = []
+            for node in nodes:
+                match = {var or 'n': node}
+                if self._check_where_for_match(match, where):
+                    filtered.append(node)
+            nodes = filtered
+        
+        return nodes
+
+    def _find_rels_to_delete(self, rel_spec, where=None):
+        """Находит связи для удаления"""
+        rel_type = rel_spec.get('rel_type')
+        props = rel_spec.get('props', {})
+        var = rel_spec.get('var')
+        
+        # Если есть переменная в контексте
+        if var and var in self.context:
+            rel = self.context[var]
+            if isinstance(rel, Relationship):
+                if where:
+                    # Для связей WHERE проверяем сложнее, пока пропускаем
+                    pass
+                return [rel]
+            return []
+        
+        # Ищем по типу
+        sql = "SELECT id, start_id, end_id, type, props FROM rels WHERE 1=1"
+        params = []
+        
+        if rel_type:
+            sql += " AND type = ?"
+            params.append(rel_type)
+        
+        cur = self.graph.db.execute(sql, params)
+        result = []
+        for row in cur:
+            rel = Relationship(row[0], row[1], row[2], row[3], json.loads(row[4]))
+            if props:
+                if all(str(rel.props.get(k)) == str(v) for k, v in props.items()):
+                    result.append(rel)
+            else:
+                result.append(rel)
+        return result
+    
+    def _delete_rels_for_node(self, node_id):
+        """Удаляет все связи узла (каскадно)"""
+        # Находим все связи где узел start или end
+        cur = self.graph.db.execute(
+            "SELECT id FROM rels WHERE start_id = ? OR end_id = ?", 
+            (node_id, node_id)
+        )
+        for row in cur:
+            self.graph.delete_rel(row[0])
+            
     def set_clause(self, args):
         """MATCH ... SET ... - работает с новым форматом dict"""
         node_spec = args[0]  # dict: {'type': 'node', 'var': 'n', 'label': 'Person', ...}

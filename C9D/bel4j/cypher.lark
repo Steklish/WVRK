@@ -1,15 +1,25 @@
 ?start: query
 
-query : match_clause | create_clause | delete_clause | update_clause
+query : match_clause | create_clause | delete_clause | update_clause | match_create_clause
 
-create_clause : "CREATE" path_pattern ("," path_pattern)*
-match_clause  : "MATCH"  path_pattern ("WHERE" condition)? "RETURN" return_item ("," return_item)*
+match_clause  : "MATCH" match_paths ("WHERE" condition)? "RETURN" return_items
+match_create_clause : "MATCH" match_paths ("WHERE" condition)? "CREATE" create_paths
+
+match_paths : path_pattern ("," path_pattern)*
+create_paths : path_pattern ("," path_pattern)*
+return_items : return_item ("," return_item)*
+
+create_clause : "CREATE" create_paths
 delete_clause : "DELETE" node_pattern ("WHERE" condition)?
 update_clause : "UPDATE" node_pattern ("WHERE" condition)? "SET" set_item ("," set_item)*
 
 path_pattern  : node_pattern (rel_pattern node_pattern)*
-node_pattern  : "(" identifier (":" label)? (props)? ")"
-rel_pattern   : "-[" rel_info "]->" | "<-[" rel_info "]-" | "-[" rel_info "]-"
+node_pattern  : "(" identifier? (":" label)? (props)? ")"
+rel_pattern   : rel_out | rel_in | rel_both
+
+rel_out       : "-[" rel_info "]->"
+rel_in        : "<-[" rel_info "]-"
+rel_both      : "-[" rel_info "]-"
 rel_info      : identifier? (":" rel_type)? (props)?
 rel_type      : CNAME
 
@@ -28,7 +38,9 @@ label         : CNAME
 prop_name     : CNAME
 props         : "{" prop_pair ("," prop_pair)* "}"
 prop_pair     : CNAME ":" literal
-literal       : STRING | NUMBER
+literal       : STRING | NUMBER | BOOLEAN
+
+BOOLEAN       : "true" | "false" | "True" | "False"
 
 EQUAL : "="
 GT    : ">"

@@ -20,6 +20,7 @@ def _unwrap(item):
     if isinstance(item, Token):
         return (str(item).strip('"') if item.type == 'STRING' else
                 float(item)          if item.type == 'NUMBER' else
+                str(item).lower() == 'true' if str(item).lower() in ['true','false'] else
                 str(item))
     return item
 
@@ -29,34 +30,50 @@ class Exec(Transformer):
         super().__init__()
         self.graph = graph
         self.result: list = []
+        self.context: dict = {}
 
     # ========== единый обработчик CREATE ==========
-    def create_clause(self, children):
-        """CREATE (a)-[:R]->(b) -- children содержит path_pattern'ы"""
+    def create_clause(self, args):
+        """CREATE (a)-[:R]->(b) -- всегда создаем новые, без контекста"""
+        self.context.clear()
         results = []
-        for path in children:
-            created = self._create_path(path)
-            results.extend(created)
+        # args[0] - это create_paths (список path_pattern'ов)
+        create_patterns = args[0] if args else []
+        if not isinstance(create_patterns, list):
+            create_patterns = [create_patterns]
+            
+        for path in create_patterns:
+            if isinstance(path, list):
+                created = self._create_path(path, use_context=False)
+                results.extend(created)
         return results
     
     # ========== обработка шаблонов узлов ==========
     def node_pattern(self, children):
-        var = str(children[0])
-        label = None  # None = любой тип (ALL)
+        # Обработка случая, когда identifier отсутствует
+        var = None
+        label = None
         props = {}
         
-        # Разбираем оставшиеся элементы
-        remaining = children[1:]
-        
-        for child in remaining:
-            if isinstance(child, str) and child != var:
-                # Это label (например 'Person')
-                label = child
+        for child in children:
+            if isinstance(child, str):
+                if var is None and not child.startswith(':') and '=' not in child:
+                    var = child
+                elif child != var:
+                    label = child
             elif isinstance(child, dict):
-                # Это props
                 props = child
         
         return {'type': 'node', 'var': var, 'label': label, 'props': props}
+
+    def match_paths(self, children):
+        return children
+
+    def create_paths(self, children):
+        return children
+
+    def return_items(self, children):
+        return children
 
     def props(self, children):
         # Children are prop_pairs
@@ -202,32 +219,66 @@ class Exec(Transformer):
         return []
         
     def match_clause(self, args):
-        path = args[0]
+        """
+        args[0]: match_paths - список path_pattern'ов
+        args[1]: condition (если есть WHERE) или return_items
+        args[2]: return_items (если есть WHERE)
+        """
+        match_patterns = args[0] if len(args) > 0 else []
+        if not isinstance(match_patterns, list):
+            match_patterns = [match_patterns]
+        
         where = None
-        ret_items = []  # теперь это список строк!
+        ret_items = []
         
-        for r in args[1:]:
-            if isinstance(r, Tree) and r.data == 'condition':
-                where = r
-            elif isinstance(r, str):  # return_item теперь возвращает строку
-                ret_items.append(r)
-            elif isinstance(r, list):  # на случай если несколько return_item
-                ret_items.extend([x for x in r if isinstance(x, str)])
+        if len(args) == 2:
+            # Нет WHERE: MATCH ... RETURN ...
+            ret_items = args[1] if isinstance(args[1], list) else [args[1]]
+        elif len(args) == 3:
+            # Есть WHERE: MATCH ... WHERE ... RETURN ...
+            where = args[1]
+            ret_items = args[2] if isinstance(args[2], list) else [args[2]]
         
-        # Если нет return_items, возвращаем все переменные из пути
-        if not ret_items and path:
-            ret_items = [elem.get('var') for elem in path if elem.get('var')]
+        if not match_patterns:
+            return []
         
-        # Ищем пути
-        matches = self._match_path(path, where)
+        # Обрабатываем все паттерны MATCH (декартово произведение)
+        # Начинаем с первого паттерна
+        all_matches = self._match_path(match_patterns[0], where if len(match_patterns) == 1 else None)
+        
+        # Если паттернов несколько (например MATCH (a), (b)), делаем соединение
+        for i in range(1, len(match_patterns)):
+            next_pattern = match_patterns[i]
+            next_matches = self._match_path(next_pattern, None)
+            
+            # Декартово произведение
+            combined = []
+            for m1 in all_matches:
+                for m2 in next_matches:
+                    # Проверяем, что переменные не конфликтуют (если одна и та же переменная в разных паттернах)
+                    conflict = False
+                    for key in m1:
+                        if key in m2 and m1[key].id != m2[key].id:
+                            conflict = True
+                            break
+                    if not conflict:
+                        combined.append({**m1, **m2})
+            all_matches = combined
+            
+            # Применяем WHERE после соединения всех паттернов (если он еще не применен)
+            if where and i == len(match_patterns) - 1:
+                all_matches = [m for m in all_matches if self._check_where_for_match(m, where)]
+        
+        # Если был всего один паттерн и есть WHERE, _match_path уже применил фильтр (если мы его туда передали)
+        # Но если мы применяли WHERE выше для одного паттерна, он уже отработал
         
         # Формируем результат
         results = []
-        for match in matches:
+        for match in all_matches:
             row = {}
             for item in ret_items:
                 if '.' in item:
-                    var, prop = item.split('.')
+                    var, prop = item.split('.', 1)  # разделяем только по первой точке
                     obj = match.get(var)
                     if isinstance(obj, (Node, Relationship)):
                         row[item] = obj.props.get(prop)
@@ -235,7 +286,10 @@ class Exec(Transformer):
                         row[item] = None
                 else:
                     obj = match.get(item)
-                    row[item] = obj
+                    if isinstance(obj, (Node, Relationship)):
+                        row[item] = obj  # или можно возвращать obj.props если нужно
+                    else:
+                        row[item] = obj
             results.append(row)
         return results
         
@@ -340,76 +394,137 @@ class Exec(Transformer):
         if not isinstance(children, list):
             children = [children]
         return children
-
-    def rel_pattern(self, children):
+    
+    def rel_out(self, children):
         result = {'type': 'rel', 'direction': 'out'}
         for child in children:
-            if isinstance(child, Token):
-                if child.value == '<-': result['direction'] = 'in'
-                elif child.value == '->': result['direction'] = 'out'
-            elif isinstance(child, dict):
+            if isinstance(child, dict):
                 result.update(child)
         return result
-    
+
+    def rel_in(self, children):
+        result = {'type': 'rel', 'direction': 'in'}
+        for child in children:
+            if isinstance(child, dict):
+                result.update(child)
+        return result
+
+    def rel_both(self, children):
+        result = {'type': 'rel', 'direction': 'both'}
+        for child in children:
+            if isinstance(child, dict):
+                result.update(child)
+        return result
+
+    def rel_pattern(self, children):
+        # Собираем строку из всех токенов для анализа
+        tokens_str = ''
+        for child in children:
+            if isinstance(child, Token):
+                tokens_str += str(child.value)  # Используем .value, а не str()
+        
+        
+        # Определяем направление
+        has_in = '<-' in tokens_str
+        has_out = '->' in tokens_str
+        
+        if has_in and not has_out:
+            direction = 'in'      # <-[]-
+        elif has_out and not has_in:
+            direction = 'out'     # -[]->
+        else:
+            direction = 'both'    # -[]- или <-[]->
+        
+        result = {'type': 'rel', 'direction': direction}
+        
+        # Добавляем информацию из rel_info (var, type, props)
+        for child in children:
+            if isinstance(child, dict):
+                result.update(child)
+        
+        return result
+        
     def rel_info(self, children):
-        """Парсит [r:TYPE {props}] - исправлено для различения var и type"""
+        """Парсит [r:TYPE {props}] - исправлено для надежного извлечения props"""
         result = {}
         for child in children:
-            if isinstance(child, str):  # <-- ИЗМЕНЕНИЕ: проверяем str первым!
-                # Это уже строка (от processed Token)
+            if isinstance(child, str):
                 val = child
-                if val[0].islower() if val else False:  # переменные обычно с маленькой
+                if val and val[0].islower():
                     result['var'] = val
                 else:
                     result['rel_type'] = val
             elif isinstance(child, Token):
                 val = str(child)
-                if val[0].islower() if val else False:
+                if val and val[0].islower():
                     result['var'] = val
                 else:
                     result['rel_type'] = val
             elif isinstance(child, Tree):
-                if child.data == 'rel_type' and child.children:
+                # Если Tree не преобразовался в dict автоматически (на всякий случай)
+                if child.data == 'props':
+                    # Преобразуем вручную
+                    props_dict = {}
+                    for prop_item in child.children:
+                        if isinstance(prop_item, (tuple, list)) and len(prop_item) == 2:
+                            k, v = prop_item
+                            props_dict[str(k)] = v
+                        elif isinstance(prop_item, Tree) and prop_item.data == 'prop_pair':
+                            k, v = prop_item.children
+                            props_dict[str(_unwrap(k))] = _unwrap(v)
+                    result['props'] = props_dict
+                elif child.data == 'rel_type' and child.children:
                     result['rel_type'] = str(child.children[0])
             elif isinstance(child, dict):
+                # Это результат метода props - используем как есть
                 result['props'] = child
         return result
-
-    def _create_path(self, path_elements):
-        """Создает цепочку: узел-связь-узел с учетом направления (->, <-, --)"""
+    
+    def _create_path(self, path_elements, use_context=False):
+        """
+        Создает цепочку узел-связь-узел.
+        Если use_context=True и переменная есть в self.context - используем существующий узел.
+        """
         created = []
         nodes = []  # [(var_name, node_obj), ...]
-        pending_rel = None  # Отложенная связь с направлением
+        pending_rel = None
         
         i = 0
         while i < len(path_elements):
             elem = path_elements[i]
             
             if elem['type'] == 'node':
-                # Создаем узел
-                node = self.graph.create_node(
-                    {elem['label']}, 
-                    elem.get('props', {})
-                )
-                nodes.append((elem.get('var'), node))
-                created.append(node)
+                var = elem.get('var')
                 
-                # Если есть отложенная связь и теперь узлов достаточно - создаем её
+                # Проверяем, можем ли использовать существующий узел из контекста MATCH
+                if use_context and var and var in self.context:
+                    # Используем существующий узел (не создаем новый)
+                    existing_node = self.context[var]
+                    nodes.append((var, existing_node))
+                    # Проверка совместимости label/props если они указаны в CREATE
+                    if elem.get('label') and elem['label'] not in existing_node.labels:
+                        raise ValueError(f"Node {var} exists with labels {existing_node.labels}, expected {elem['label']}")
+                else:
+                    # Создаем новый узел
+                    labels = {elem['label']} if elem.get('label') else set()
+                    node = self.graph.create_node(labels, elem.get('props', {}))
+                    nodes.append((var, node))
+                    created.append(node)
+                    # Если есть переменная, сохраняем в контекст для дальнейшего использования в этом же пути
+                    if var:
+                        self.context[var] = node
+                
+                # Обработка отложенной связи
                 if pending_rel and len(nodes) >= 2:
-                    prev_node = nodes[-2][1]  # предыдущий узел (a)
-                    curr_node = nodes[-1][1]  # текущий узел (b)
+                    prev_node = nodes[-2][1]
+                    curr_node = nodes[-1][1]
                     
-                    # Определяем направление связи
                     direction = pending_rel.get('direction', 'out')
                     
                     if direction == 'in':
-                        # Входящая связь: (a)<-[:TYPE]-(b) означает b->a
-                        # start = b (текущий), end = a (предыдущий)
                         start_id = curr_node.id
                         end_id = prev_node.id
                     else:
-                        # Исходящая или ненаправленная: (a)-[:TYPE]->(b)
-                        # start = a (предыдущий), end = b (текущий)
                         start_id = prev_node.id
                         end_id = curr_node.id
                     
@@ -420,10 +535,9 @@ class Exec(Transformer):
                         pending_rel.get('props', {})
                     )
                     created.append(rel)
-                    pending_rel = None  # Сбрасываем отложенную связь
+                    pending_rel = None
                     
             elif elem['type'] == 'rel':
-                # Откладываем связь до создания следующего узла
                 pending_rel = elem
                     
             i += 1
@@ -525,14 +639,24 @@ class Exec(Transformer):
         label = node_spec.get('label')
         props = node_spec.get('props', {})
         
-        # Используем индекс если есть конкретное свойство
         if label and props:
-            for k, v in props.items():
-                ids = self.graph.index.lookup(label, k, str(v))
-                if ids:
-                    return [self.graph.get_node(i) for i in ids if self.graph.get_node(i)]
+            first_prop = next(iter(props))
+            first_val = str(props[first_prop])
+            ids = self.graph.index.lookup(label, first_prop, first_val)
+            
+            if ids:
+                result = []
+                for node_id in ids:
+                    node = self.graph.get_node(node_id)
+                    if node:
+                        if all(str(node.props.get(k)) == str(v) for k, v in props.items()):
+                            result.append(node)
+                if result:
+                    return result
+            # КРИТИЧНО: Если не нашли по индексу или после фильтрации пусто - возвращаем []
+            # НЕ сканируем все узлы, т.к. мы искали конкретный узел с конкретными props
+            return []
         
-        # Иначе сканируем по label
         if label:
             cur = self.graph.db.execute("SELECT id FROM nodes WHERE json_extract(labels,'$[0]')=?", (label,))
         else:
@@ -639,7 +763,72 @@ class Exec(Transformer):
                 updated.append(node)
         
         return [{"updated": len(updated), "nodes": [n.id for n in updated]}]
-
+    
+    # ========== MATCH ... CREATE ... ==========
+    def match_create_clause(self, args):
+        """
+        args[0]: match_paths - список паттернов для поиска
+        args[1]: condition (если есть) или create_paths
+        args[2]: create_paths (если есть condition)
+        """
+        match_patterns = args[0] if len(args) > 0 else []
+        if not isinstance(match_patterns, list):
+            match_patterns = [match_patterns]
+        
+        where = None
+        create_patterns = []
+        
+        if len(args) == 2:
+            # Нет WHERE
+            create_patterns = args[1] if isinstance(args[1], list) else [args[1]]
+        elif len(args) == 3:
+            # Есть WHERE
+            where = args[1]
+            create_patterns = args[2] if isinstance(args[2], list) else [args[2]]
+        
+        if not match_patterns or not create_patterns:
+            return []
+        
+        # Находим все совпадения для MATCH (аналогично match_clause)
+        all_matches = self._match_path(match_patterns[0], where if len(match_patterns) == 1 else None)
+        
+        # Обрабатываем дополнительные паттерны MATCH (если есть)
+        for i in range(1, len(match_patterns)):
+            next_pattern = match_patterns[i]
+            next_matches = self._match_path(next_pattern, None)
+            
+            combined = []
+            for m1 in all_matches:
+                for m2 in next_matches:
+                    conflict = False
+                    for key in m1:
+                        if key in m2 and m1[key].id != m2[key].id:
+                            conflict = True
+                            break
+                    if not conflict:
+                        combined.append({**m1, **m2})
+            all_matches = combined
+            
+            if where and i == len(match_patterns) - 1:
+                all_matches = [m for m in all_matches if self._check_where_for_match(m, where)]
+        
+        if not all_matches:
+            return []
+        
+        all_created = []
+        
+        # Для каждой строки результата MATCH выполняем CREATE
+        for match in all_matches:
+            self.context = match.copy()  # Загружаем переменные из MATCH
+            
+            for path in create_patterns:
+                created = self._create_path(path, use_context=True)
+                all_created.extend(created)
+            
+            self.context.clear()
+        
+        return all_created
+    
 def execute(graph: Graph, query: str):
     tree = parser.parser.parse(query)
     result = Exec(graph).transform(tree)

@@ -303,7 +303,16 @@ class Exec(Transformer):
         return str(children[0])
 
     def set_item(self, children):
-        return children
+        """identifier "." prop_name "=" literal -> ('=', 'n', 'age', 30)"""
+        if len(children) >= 3:
+            var = str(children[0])
+            prop = str(children[1])
+            val = children[2]
+            result = ('=', var, prop, val)
+            return result
+        # Fallback - не должно случиться
+        return ('=', '', '', 0)
+
     
     def path_pattern(self, children):
         """Всегда возвращает список элементов пути"""   
@@ -556,8 +565,56 @@ class Exec(Transformer):
             except (ValueError, TypeError):
                 # Если не получилось сравнить как числа, сравниваем как строки
                 return str(actual_val) == str(val) if op == '=' else False
-        
         return False
+    
+    def update_clause(self, args):
+        node_spec = args[0]
+        label = node_spec['label']
+        ident = node_spec['var']
+        
+        where = None
+        set_items = []
+        
+        # Собираем все кортежи из args (пропускаем node_spec и condition)
+        for r in args[1:]:
+            if isinstance(r, Tree) and r.data == 'condition':
+                where = r
+            elif isinstance(r, tuple) and len(r) == 4:  # ('=', 'p', 'age', 31.0)
+                set_items.append(r)
+        
+        # Находим узлы для обновления
+        if where:
+            flat_where = self._flatten_expr(where)
+            nodes = self._filter_nodes(flat_where, label, ident, None)
+        else:
+            # Без WHERE - обновляем все узлы с этим label
+            cur = self.graph.db.execute("SELECT id FROM nodes WHERE json_extract(labels,'$[0]')=?", (label,))
+            nodes = [self.graph.get_node(row[0]) for row in cur if self.graph.get_node(row[0])]
+        
+        if not nodes:
+            return []
+        
+        # Применяем UPDATE
+        updated = []
+        for node in nodes:
+            new_props = {}
+            for item in set_items:  # item = ('=', 'n', 'age', 30)
+                _, e_ident, prop, val = item
+                if e_ident == ident:
+                    new_props[prop] = val
+            
+            if new_props:
+                # Обновляем SQLite
+                merged_props = {**node.props, **new_props}
+                self.graph.db.execute("UPDATE nodes SET props=? WHERE id=?",
+                                    (json.dumps(merged_props), node.id))
+                # Обновляем индекс
+                self.graph._update_index(node.id, label, new_props)
+                node.props.update(new_props)
+                updated.append(node)
+        
+        return [{"updated": len(updated), "nodes": [n.id for n in updated]}]
+
 def execute(graph: Graph, query: str):
     tree = parser.parser.parse(query)
     result = Exec(graph).transform(tree)

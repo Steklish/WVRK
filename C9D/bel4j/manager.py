@@ -15,6 +15,11 @@ class Manager:
     @staticmethod
     def exists(name: str) -> bool:
         return (DB_DIR / f"{name}.db").is_file()
+    
+    @staticmethod
+    def get_path(name: str) -> Path:
+        """Возвращает путь к файлу базы"""
+        return DB_DIR / f"{name}.db"
 
     @staticmethod
     def create(name: str) -> Graph:
@@ -31,3 +36,13 @@ class Manager:
         if not path.exists():
             raise FileNotFoundError("База не найдена")
         return Graph(str(path))
+    
+    @staticmethod
+    def drop(name: str) -> None:
+        """Удаляет базу данных"""
+        if not valid_name.fullmatch(name):
+            raise ValueError("Имя базы — буквы, цифры, _, длиной 1-32")
+        path = DB_DIR / f"{name}.db"
+        if not path.exists():
+            raise FileNotFoundError("База не найдена")
+        path.unlink()  

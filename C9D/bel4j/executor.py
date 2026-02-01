@@ -42,8 +42,19 @@ class Exec(Transformer):
     # ========== обработка шаблонов узлов ==========
     def node_pattern(self, children):
         var = str(children[0])
-        label = str(children[1]) if len(children) > 1 else 'Node'
-        props = children[2] if len(children) > 2 and isinstance(children[2], dict) else {}
+        label = None  # None = любой тип (ALL)
+        props = {}
+        
+        # Разбираем оставшиеся элементы
+        remaining = children[1:]
+        
+        for child in remaining:
+            if isinstance(child, str) and child != var:
+                # Это label (например 'Person')
+                label = child
+            elif isinstance(child, dict):
+                # Это props
+                props = child
         
         return {'type': 'node', 'var': var, 'label': label, 'props': props}
 
@@ -123,7 +134,6 @@ class Exec(Transformer):
                 '>': operator.gt, '>=': operator.ge,
                 '<': operator.lt, '<=': operator.le}
         
-        # print("[DEBUG]", expr)
         # 1. primary_condition
         if expr[0] in op_map:
             op_str, e_ident, prop, val = expr
@@ -131,12 +141,18 @@ class Exec(Transformer):
                 return pre_nodes if pre_nodes is not None else []
 
             op_func = op_map[op_str]
-            if pre_nodes is None and op_str == "=":
+            
+            # Используем индекс только если есть конкретный label и оператор =
+            if pre_nodes is None and op_str == "=" and label is not None:
                 ids = self.graph.index.lookup(label, prop, str(val))
                 return [self.graph.get_node(i) for i in ids if self.graph.get_node(i)]
 
             if pre_nodes is None:
-                cur = self.graph.db.execute("SELECT id FROM nodes WHERE json_extract(labels,'$[0]')=?", (label,))
+                # Если label=None - выбираем ВСЕ узлы, иначе по label
+                if label is None:
+                    cur = self.graph.db.execute("SELECT id FROM nodes")
+                else:
+                    cur = self.graph.db.execute("SELECT id FROM nodes WHERE json_extract(labels,'$[0]')=?", (label,))
                 pre_nodes = [self.graph.get_node(r[0]) for r in cur if self.graph.get_node(r[0])]
 
             result = []
@@ -152,13 +168,13 @@ class Exec(Transformer):
                         result.append(n)
             return result
 
-        # 2. AND
+        # 2. AND - без изменений
         if expr[0] == 'AND':
             left, right = expr[1], expr[2]
             interim = self._filter_nodes(left, label, ident, pre_nodes)
             return self._filter_nodes(right, label, ident, interim)
 
-        # 3. OR
+        # 3. OR 
         if expr[0] == 'OR':
             left, right = expr[1], expr[2]
             left_ids  = {n.id for n in self._filter_nodes(left, label, ident, pre_nodes)}
@@ -170,14 +186,19 @@ class Exec(Transformer):
                 f"SELECT id, labels, props FROM nodes WHERE id IN ({','.join('?'*len(merged))})",
                 list(merged))
             return [Node(id=r[0], labels=json.loads(r[1]), props=json.loads(r[2])) for r in cur]
+    
         # 4. NOT
         if expr[0] == 'NOT':
             sub = expr[1]
             if pre_nodes is None:
-                cur = self.graph.db.execute("SELECT id FROM nodes WHERE json_extract(labels,'$[0]')=?", (label,))
+                if label is None:
+                    cur = self.graph.db.execute("SELECT id FROM nodes")
+                else:
+                    cur = self.graph.db.execute("SELECT id FROM nodes WHERE json_extract(labels,'$[0]')=?", (label,))
                 pre_nodes = [self.graph.get_node(r[0]) for r in cur if self.graph.get_node(r[0])]
             forbidden_ids = {n.id for n in self._filter_nodes(sub, label, ident, pre_nodes)}
             return [n for n in pre_nodes if n.id not in forbidden_ids]
+        
         return []
         
     def match_clause(self, args):
@@ -219,9 +240,8 @@ class Exec(Transformer):
         return results
         
     def delete_clause(self, args):
-        # args: [node_spec, where_condition?]
-        node_spec = args[0]  # dict: {'type': 'node', 'var': 'p', 'label': 'Person', ...}
-        label = node_spec['label']
+        node_spec = args[0]
+        label = node_spec['label']  
         ident = node_spec['var']
         
         where = None
@@ -230,18 +250,19 @@ class Exec(Transformer):
                 where = r
                 break
         
-        # Находим узлы для удаления
         if where:
             flat_expr = self._flatten_expr(where)
             nodes = self._filter_nodes(flat_expr, label, ident, None)
         else:
-            # Если нет WHERE — удаляем ВСЕ узлы с таким label (опасно!)
-            cur = self.graph.db.execute("SELECT id FROM nodes WHERE json_extract(labels,'$[0]')=?", (label,))
-            nodes = [self.graph.get_node(row[0]) for row in cur]
+            if label is None:
+                cur = self.graph.db.execute("SELECT id FROM nodes")
+            else:
+                cur = self.graph.db.execute("SELECT id FROM nodes WHERE json_extract(labels,'$[0]')=?", (label,))
+            nodes = [self.graph.get_node(row[0]) for row in cur if self.graph.get_node(row[0])]
         
         deleted_count = 0
         for node in nodes:
-            self.graph.delete_node(node.id)  # Каскадное удаление связей уже есть в core.py
+            self.graph.delete_node(node.id)
             deleted_count += 1
         
         return [{"deleted": deleted_count, "nodes": [n.id for n in nodes]}]
@@ -518,6 +539,7 @@ class Exec(Transformer):
             cur = self.graph.db.execute("SELECT id FROM nodes")
         
         return [self.graph.get_node(row[0]) for row in cur if self.graph.get_node(row[0])]
+    
     def _check_where_for_match(self, match, where):
         """Проверяет WHERE для найденного пути"""
         if not where:
@@ -587,8 +609,11 @@ class Exec(Transformer):
             flat_where = self._flatten_expr(where)
             nodes = self._filter_nodes(flat_where, label, ident, None)
         else:
-            # Без WHERE - обновляем все узлы с этим label
-            cur = self.graph.db.execute("SELECT id FROM nodes WHERE json_extract(labels,'$[0]')=?", (label,))
+            if label is None:
+                cur = self.graph.db.execute("SELECT id FROM nodes")
+            else:
+                # Без WHERE - обновляем все узлы с этим label
+                cur = self.graph.db.execute("SELECT id FROM nodes WHERE json_extract(labels,'$[0]')=?", (label,))
             nodes = [self.graph.get_node(row[0]) for row in cur if self.graph.get_node(row[0])]
         
         if not nodes:

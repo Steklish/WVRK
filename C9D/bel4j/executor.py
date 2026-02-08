@@ -18,10 +18,20 @@ def _unwrap(item):
             return str(_unwrap(k)), _unwrap(v)
         return [_unwrap(ch) for ch in item.children]
     if isinstance(item, Token):
-        return (str(item).strip('"') if item.type == 'STRING' else
-                float(item)          if item.type == 'NUMBER' else
-                str(item).lower() == 'true' if str(item).lower() in ['true','false'] else
-                str(item))
+        if item.type in ('STRING_SINGLE', 'STRING_DOUBLE', 'STRING'):
+            val = str(item.value)
+            if (val.startswith('"') and val.endswith('"')) or \
+               (val.startswith("'") and val.endswith("'")):
+                val = val[1:-1]
+            return val
+        
+        if item.type == 'NUMBER':
+            return float(item)
+        
+        if str(item).lower() in ['true', 'false']:
+            return str(item).lower() == 'true'
+        
+        return str(item)
     return item
 
 
@@ -145,7 +155,6 @@ class Exec(Transformer):
 
         # 3. primary_condition – раскрываем вручную
         if isinstance(expr, Tree) and expr.data == 'primary_condition':
-            # print('[CHILD]', expr.children)
             ident_tok, prop_tok, op_tok, val_tok = expr.children
             op_token = op_tok.children[0]  # Tree → Token
             return (str(op_token),
@@ -1005,7 +1014,252 @@ class Exec(Transformer):
             self.context.clear()
         
         return all_created
-    
+    def on_create_set(self, children):
+        # children: [set_item, set_item, ...] (без "ON","CREATE","SET")
+        return ("ON_CREATE", children[0])
+
+    def on_match_set(self, children):
+        return ("ON_MATCH", children[0])
+
+    def set_items(self, children):
+        return children  # просто список set_item
+
+    def merge_clause(self, args):
+        merge_patterns = args[0] if args else []
+        if not isinstance(merge_patterns, list):
+            merge_patterns = [merge_patterns]
+        
+        # Парсим ON CREATE SET и ON MATCH SET
+        on_create_items = []
+        on_match_items = []
+        
+        # Теперь args содержит кортежи ("ON_CREATE", [...]) и ("ON_MATCH", [...])
+        for arg in args[1:]:
+            if isinstance(arg, tuple) and len(arg) == 2:
+                marker, items = arg
+                if marker == "ON_CREATE":
+                    on_create_items = items if isinstance(items, list) else [items]
+                elif marker == "ON_MATCH":
+                    on_match_items = items if isinstance(items, list) else [items]
+        
+        all_merged = []
+        
+        for path in merge_patterns:
+            merged = self._merge_path(path, on_create_items, on_match_items)
+            all_merged.extend(merged)
+        
+        return all_merged
+
+    def _merge_path(self, path_elements, on_create_items, on_match_items):
+        if not path_elements:
+            return []
+        
+        created_elements = []
+        matched_elements = []
+        nodes_context = {}
+        pending_rels = []  # Отложенные связи для обработки
+        
+        # Первый проход: обрабатываем только узлы
+        i = 0
+        while i < len(path_elements):
+            elem = path_elements[i]
+            
+            if elem.get('type') == 'node':
+                var = elem.get('var')
+                label = elem.get('label')
+                props = elem.get('props', {})
+                
+                existing = self._find_nodes_by_props(label, props)
+                
+                if existing:
+                    node = existing[0]
+                    matched_elements.append(('node', node, var))
+                else:
+                    labels = {label} if label else set()
+                    node = self.graph.create_node(labels, props)
+                    created_elements.append(('node', node, var))
+                
+                if var:
+                    nodes_context[var] = node
+                    self.context[var] = node
+                
+                # Запоминаем связь для обработки (если есть)
+                if i > 0 and path_elements[i-1].get('type') == 'rel':
+                    # Сохраняем: (предыдущий_узел_спек, связь, текущий_узел_спек)
+                    pending_rels.append((
+                        path_elements[i-2],  # start node spec
+                        path_elements[i-1],  # rel spec
+                        elem                 # end node spec (текущий)
+                    ))
+                        
+            i += 1
+        
+        # Второй проход: обрабатываем связи (оба узла уже в nodes_context)
+        for start_spec, rel_spec, end_spec in pending_rels:
+            self._process_merge_rel(
+                start_spec, rel_spec, end_spec,
+                nodes_context, created_elements, matched_elements
+            )
+        
+        # Применяем ON CREATE SET к созданным элементам
+        for elem_type, element, var in created_elements:
+            if on_create_items:
+                label = None
+                if elem_type == 'node' and hasattr(element, 'labels'):
+                    label = list(element.labels)[0] if element.labels else None
+                self._apply_set_items(
+                    element, var, on_create_items, 
+                    label,
+                    is_rel=(elem_type == 'rel')
+                )
+        
+        # Применяем ON MATCH SET к найденным элементам
+        for elem_type, element, var in matched_elements:
+            if on_match_items:
+                label = None
+                if elem_type == 'node' and hasattr(element, 'labels'):
+                    label = element.labels[0] if element.labels else None
+                self._apply_set_items(
+                    element, var, on_match_items,
+                    label,
+                    is_rel=(elem_type == 'rel')
+                )
+        
+        return [elem for _, elem, _ in created_elements + matched_elements]
+
+    def _process_merge_rel(self, start_node_spec, rel_elem, end_node_spec, 
+                    nodes_context, created_elements, matched_elements):
+        """Обрабатывает связь в MERGE пути"""
+        start_var = start_node_spec.get('var')
+        end_var = end_node_spec.get('var')
+        
+        start_node = nodes_context.get(start_var)
+        end_node = nodes_context.get(end_var)
+        
+        # Теперь оба узла гарантированно есть!
+        if not start_node or not end_node:
+            print(f"DEBUG: Missing node - start:{start_node}, end:{end_node}")
+            return
+        
+        rel_var = rel_elem.get('var')
+        rel_type = rel_elem.get('rel_type', 'RELATED')
+        rel_props = rel_elem.get('props', {})
+        direction = rel_elem.get('direction', 'out')
+        
+        # Ищем существующую связь
+        existing_rels = self._find_rels_between(
+            start_node.id, end_node.id, rel_type, direction, rel_props
+        )
+        
+        if existing_rels:
+            rel = existing_rels[0]
+            matched_elements.append(('rel', rel, rel_var))
+        else:
+            # Создаём новую связь
+            if direction == 'in':
+                s, e = end_node.id, start_node.id
+            else:
+                s, e = start_node.id, end_node.id
+                
+            rel = self.graph.create_rel(s, e, rel_type, rel_props)
+            created_elements.append(('rel', rel, rel_var))
+        
+        if rel_var:
+            self.context[rel_var] = rel
+
+
+    def _find_rels_between(self, start_id, end_id, rel_type, direction, props):
+        """Ищет связи между двумя узлами с учётом направления и свойств"""
+        sql = "SELECT id, start_id, end_id, type, props FROM rels WHERE type = ?"
+        params = [rel_type]
+        
+        # Учитываем направление
+        if direction == 'out':
+            sql += " AND start_id = ? AND end_id = ?"
+            params.extend([start_id, end_id])
+        elif direction == 'in':
+            sql += " AND start_id = ? AND end_id = ?"
+            params.extend([end_id, start_id])
+        else:  # both
+            sql += " AND ((start_id = ? AND end_id = ?) OR (start_id = ? AND end_id = ?))"
+            params.extend([start_id, end_id, end_id, start_id])
+        
+        cur = self.graph.db.execute(sql, params)
+        results = []
+        
+        for row in cur:
+            rel = Relationship(row[0], row[1], row[2], row[3], json.loads(row[4]))
+            # Проверяем свойства
+            if props:
+                if all(str(rel.props.get(k)) == str(v) for k, v in props.items()):
+                    results.append(rel)
+            else:
+                results.append(rel)
+        
+        return results
+
+    def _find_nodes_by_props(self, label, props):
+        """Ищет узлы по точному совпадению label и всех свойств"""
+        if not label and not props:
+            return []
+        
+        # Строим SQL запрос с условиями на все свойства
+        conditions = []
+        params = []
+        
+        if label:
+            conditions.append("json_extract(labels,'$[0]') = ?")
+            params.append(label)
+        
+        for key, value in props.items():
+            conditions.append(f"json_extract(props,'$.{key}') = ?")
+            params.append(json.dumps(value) if isinstance(value, (dict, list)) else value)
+        
+        where_clause = " AND ".join(conditions) if conditions else "1=1"
+        sql = f"SELECT id, labels, props FROM nodes WHERE {where_clause}"
+        
+        cur = self.graph.db.execute(sql, params)
+        nodes = []
+        for row in cur:
+            nodes.append(Node(id=row[0], labels=json.loads(row[1]), props=json.loads(row[2])))
+        
+        return nodes
+
+    def _apply_set_items(self, element, var, set_items, label, is_rel=False):
+        """Применяет SET items к узлу или связи"""
+        new_props = {}
+        for item in set_items:
+            if len(item) >= 4:
+                _, e_ident, prop, val = item
+                if e_ident == var:
+                    if callable(val):
+                        val = val()
+                    new_props[prop] = val
+        
+        if not new_props:
+            return
+        
+        merged_props = {**element.props, **new_props}
+        
+        if is_rel:
+            # Обновляем связь
+            self.graph.db.execute(
+                "UPDATE rels SET props=? WHERE id=?",
+                (json.dumps(merged_props), element.id)
+            )
+        else:
+            # Обновляем узел
+            self.graph.db.execute(
+                "UPDATE nodes SET props=? WHERE id=?",
+                (json.dumps(merged_props), element.id)
+            )
+            if label:  # Обновляем индекс только если есть label
+                self.graph._update_index(element.id, label, new_props)
+        
+        element.props.update(new_props)
+
+    def merge_paths(self, children):
+        return children
 def execute(graph: Graph, query: str):
     tree = parser.parser.parse(query)
     result = Exec(graph).transform(tree)

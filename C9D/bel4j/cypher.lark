@@ -1,11 +1,18 @@
 ?start: query
 
-query : match_clause | create_clause | delete_clause | update_clause | match_create_clause
+query : match_clause | create_clause | delete_clause | update_clause | match_create_clause | merge_clause
 
+merge_clause : "MERGE" merge_paths on_create_set? on_match_set?
 match_clause  : "MATCH" match_paths ("WHERE" condition)? "RETURN" return_items
 match_create_clause : "MATCH" match_paths ("WHERE" condition)? "CREATE" create_paths
 
+on_create_set :  "ON" "CREATE" "SET" set_items
+on_match_set :  "ON" "MATCH" "SET" set_items
+set_items : set_item ("," set_item)*
+
+merge_paths : path_pattern ("," path_pattern)*
 match_paths : path_pattern ("," path_pattern)*
+
 create_paths : path_pattern ("," path_pattern)*
 return_items : return_item ("," return_item)*
 
@@ -43,7 +50,7 @@ label         : CNAME
 prop_name     : CNAME
 props         : "{" prop_pair ("," prop_pair)* "}"
 prop_pair     : CNAME ":" literal
-literal       : STRING | NUMBER | BOOLEAN
+literal       : STRING_SINGLE | STRING_DOUBLE | NUMBER | BOOLEAN  # ← оба типа строк
 
 BOOLEAN       : "true" | "false" | "True" | "False"
 
@@ -54,8 +61,11 @@ LT    : "<"
 LE    : "<="
 NE    : "!="
 
+// Строки в одинарных и двойных кавычках
+STRING_SINGLE : /'[^']*'/      # ← одинарные
+STRING_DOUBLE : /"[^"]*"/      # ← двойные
+
 %import common.CNAME
-%import common.ESCAPED_STRING -> STRING
 %import common.NUMBER
 %import common.WS
 %ignore WS

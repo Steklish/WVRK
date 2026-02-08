@@ -1,2 +1,5 @@
-1. DELETE RELS
-2. Visual
++ 1. MERGE 
+2. COUNT/SUM/AVG
+3. ORDER BY
+4. UPDATE REAL
+5. Visual
